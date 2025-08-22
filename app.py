@@ -729,6 +729,59 @@ except Exception as e:
     print(f"✗ Error initializing Dash application: {e}")
     sys.exit(1)
 
+# =====HELPER FUNCTIONS=====
+def get_control_limits_and_apply_zoom(fig, selected_tech_layer, selected_chart_mpx, zoom_percentage, chart_name="Chart"):
+    """
+    Helper function to get fixed control limits from database and apply percentage-based zoom to chart.
+    
+    Args:
+        fig: Plotly figure object
+        selected_tech_layer: Selected technology layer
+        selected_chart_mpx: Selected measurement point
+        zoom_percentage: Zoom percentage (0-100%) that acts as buffer multiplier around LCL/UCL
+        chart_name: Name for logging
+        
+    Returns:
+        Updated figure with fixed control limits and percentage-based plot range
+    """
+    try:
+        # Get fixed control limits from database
+        control_limits_data = df[(df['TECH_LAYER'] == selected_tech_layer) & (df['MP'] == selected_chart_mpx)]
+        if not control_limits_data.empty:
+            lcl = control_limits_data['LCL'].iloc[0]  # Fixed from database
+            ucl = control_limits_data['UCL'].iloc[0]  # Fixed from database
+        else:
+            lcl, ucl = 0, 100  # Default fallback
+            print(f"⚠️ No control limits found for {selected_tech_layer}/{selected_chart_mpx}, using defaults")
+        
+        # Calculate the range between control limits
+        control_range = abs(ucl - lcl)
+        if control_range == 0:
+            control_range = abs(ucl) * 0.1 if ucl != 0 else 10  # Fallback range
+        
+        # Calculate percentage-based buffer around control limits
+        buffer_amount = control_range * (zoom_percentage / 100)
+        
+        # Calculate plot limits with percentage-based buffer
+        plot_min = lcl - buffer_amount
+        plot_max = ucl + buffer_amount
+        
+        # Add FIXED control limits from database (red dashed lines)
+        fig.add_hline(y=lcl, line_width=2, line_dash="dash", line_color="red", 
+                     annotation_text=f"LCL: {lcl:.2f}", annotation_position="bottom right")
+        fig.add_hline(y=ucl, line_width=2, line_dash="dash", line_color="red",
+                     annotation_text=f"UCL: {ucl:.2f}", annotation_position="top right")
+        
+        # Set Y-axis range based on percentage zoom (buffer around control limits)
+        fig.update_layout(yaxis_range=[plot_min, plot_max])
+        
+        print(f"✓ {chart_name} updated - LCL: {lcl:.2f}, UCL: {ucl:.2f}, Zoom: {zoom_percentage}% (range: {plot_min:.2f} to {plot_max:.2f})")
+        return fig
+        
+    except Exception as e:
+        print(f"❌ Error updating {chart_name}: {e}")
+        return fig
+
 print("Creating UI components...")
 
 try:
@@ -761,14 +814,24 @@ try:
             labelStyle={'display': 'inline-block'}
             ))
 
-    # Range slider for chart limits
-    chart_range_slider = html.Div([dcc.RangeSlider(
+    # Range slider for chart Y-axis plot zoom (percentage multiplier)
+    chart_range_slider = html.Div([
+        html.Label("Chart Zoom Level (% buffer around control limits):", style={'font-weight': 'bold'}),
+        dcc.Slider(
             id = 'limit-slider',
-            min = 100,
-            max = 200,
-            step = 10,
-            value=[110, 190],
-            tooltip={"placement": "bottom", "always_visible": False})])
+            min = 0,
+            max = 100,
+            step = 5,
+            value=10,
+            marks={
+                0: '0%',
+                10: '10%',
+                25: '25%',
+                50: '50%',
+                75: '75%',
+                100: '100%'
+            },
+            tooltip={"placement": "bottom", "always_visible": True})])
 
     # Date picker
     if 'DATE' in df.columns and not df.empty:
@@ -1036,7 +1099,7 @@ app.layout = dbc.Container([
 
 #=====CREATE INTERACTIVE GRAPHS=============
 # Callbacks are used to update the graphs and tables when the user changes the inputs 
-# chart upper lower limit slider
+# chart Y-axis zoom percentage slider configuration
 @app.callback(
     Output('limit-slider', 'min'),
     Output('limit-slider', 'max'),
@@ -1045,21 +1108,19 @@ app.layout = dbc.Container([
     Input('tech_layer_dd', 'value'),
     Input('chart_MP_radio', 'value')
 )
-def update_slider(selected_tech_layer, selected_chart_mpx):
-    # Filter the DataFrame based on selected_tech_layer and selected_chart_mpx
-    filtered_df = df[(df['TECH_LAYER'] == selected_tech_layer) & (df['MP'] == selected_chart_mpx)]
-    # Ensure there is data after filtering
-    if filtered_df.empty:
-        raise ValueError("No data found for the selected TECH_LAYER and MP combination.")
-    # Get the LCL and UCL values
-    lcl = filtered_df['LCL'].values[0]
-    ucl = filtered_df['UCL'].values[0]
-    # Calculate the limits and step
-    lower_limit = lcl - (0.1 * abs(lcl))
-    upper_limit = ucl + (0.1 * abs(ucl))
-    step = round((upper_limit - lower_limit) / 40, 1)
-    value = [lcl, ucl]
-    return lower_limit, upper_limit, step, value
+def update_zoom_percentage_slider(selected_tech_layer, selected_chart_mpx):
+    """
+    Updates the zoom percentage slider. This is now a simple percentage-based multiplier
+    that controls how much buffer to add around the fixed LCL/UCL control limits.
+    """
+    try:
+        print(f"✓ Zoom slider updated for {selected_tech_layer}/{selected_chart_mpx}")
+        # Return fixed values for percentage-based zoom control
+        return 0, 100, 5, 10  # min=0%, max=100%, step=5%, default=10%
+        
+    except Exception as e:
+        print(f"❌ Error updating zoom slider: {e}")
+        return 0, 100, 5, 10
 
 # Define the callback to update the tool_checklist based on which tools have been selected
 @app.callback(
@@ -1084,65 +1145,78 @@ def update_tool_checklist(selected_tech_layer):
     Input("chart_MP_radio", "value"),
     Input('lot_list_table', 'selected_rows'),
     State("lot_list_table", "data"))
-def update_line_chart_tool_xcol(tool, start_date, end_date, chamber, limits, selected_tech_layer, selected_chart_mpx, selected_rows, data):    # callback function arg 'tool' refers to the component property of the input or "value" above
-    if selected_rows:
-        selected_lots = [data[i]['LOT'] for i in selected_rows if i < len(data)]
-        filtered_data = df.query(
-            "DATE >= @start_date and DATE <= @end_date and TECH_LAYER == @selected_tech_layer and MP == @selected_chart_mpx and LOT in @selected_lots")
-    else:
-        filtered_data = df.query(
-            "DATE >= @start_date and DATE <= @end_date and TECH_LAYER == @selected_tech_layer and MP == @selected_chart_mpx")
-    
-    # Calculate the middle value of Y-ROW from ALL data (not just selected tools)
-    # This ensures consistent filtering regardless of which tools are selected
-    all_data_for_median = filtered_data.copy()  # Use the same lot filtering but before tool filtering
-    middle_y_row = all_data_for_median['Y-ROW'].median()
-    
-    mask = filtered_data.Tool.isin(tool) 
-    filtered_data = filtered_data[mask]
-    # Filter data to include only rows where Y-ROW is within ±1 of the middle value
-    filtered_data = filtered_data[(filtered_data['Y-ROW'] >= middle_y_row - 1) & (filtered_data['Y-ROW'] <= middle_y_row + 1)]
-    # Sort the filtered data by X-COL
-    sorted_data = filtered_data.sort_values(by='X-COL')
-    sorted_tools = sorted([str(tl) for tl in filtered_data['Tool'].unique().tolist() if tl is not None])
-    title = "Selected Lots by Tool"                                  
-    fig = px.line(sorted_data,   
-        x='X-COL', y='CD', color='Tool'
-        ,color_discrete_sequence = ['darkorange', 'dodgerblue', 'green', 'darkviolet']
-        ,line_shape="hv"
-        ,hover_data=['LOT', 'WFR']
-        ,markers=True,
-        title=title,
-        template=chart_theme,
-        category_orders={'Tool': sorted_tools})
-    fig.update_traces(mode="markers")
-    
-    # Add trend lines for each tool (connecting means at each X-COL)
-    colors = ['darkorange', 'dodgerblue', 'green', 'darkviolet']
-    for i, tl in enumerate(sorted_tools):
-        tool_data = sorted_data[sorted_data['Tool'] == tl]
-        if len(tool_data) > 0:
-            # Calculate mean CD at each X-COL position for this tool
-            tool_means = tool_data.groupby('X-COL')['CD'].mean().reset_index()
-            # Sort by X-COL to ensure proper line connection
-            tool_means = tool_means.sort_values('X-COL')
-            
-            # Add trend line connecting the means
-            fig.add_trace(go.Scatter(
-                x=tool_means['X-COL'], 
-                y=tool_means['CD'],
-                mode='lines',
-                name=f'Trend {tl}',
-                line=dict(color=colors[i % len(colors)], dash='dot', width=3),
-                showlegend=False
-            ))
-    
-    fig.add_hline(y=limits[0], line_width=2, line_dash="dash", line_color="red")
-    fig.add_hline(y=limits[1], line_width=2, line_dash="dash", line_color="red")
-    fig.add_hline(y=limits[0] - 0.02 * limits[0], line_width=1, line_dash="solid", line_color="white")
-    fig.add_hline(y=limits[1] + 0.02 * limits[1], line_width=1, line_dash="solid", line_color="white")
-    #fig.add_hline(y=target, line_width=1, line_dash="dash", line_color="black")
-    return fig
+def update_line_chart_tool_xcol(tool, start_date, end_date, chamber, zoom_percentage, selected_tech_layer, selected_chart_mpx, selected_rows, data):
+    """
+    Updates line chart with tool data. Uses fixed LCL/UCL from database and zoom_percentage for Y-axis limits.
+    """
+    try:
+        if selected_rows:
+            selected_lots = [data[i]['LOT'] for i in selected_rows if i < len(data)]
+            filtered_data = df.query(
+                "DATE >= @start_date and DATE <= @end_date and TECH_LAYER == @selected_tech_layer and MP == @selected_chart_mpx and LOT in @selected_lots")
+        else:
+            filtered_data = df.query(
+                "DATE >= @start_date and DATE <= @end_date and TECH_LAYER == @selected_tech_layer and MP == @selected_chart_mpx")
+        
+        # Get fixed control limits from database
+        control_limits_data = df[(df['TECH_LAYER'] == selected_tech_layer) & (df['MP'] == selected_chart_mpx)]
+        if not control_limits_data.empty:
+            lcl = control_limits_data['LCL'].iloc[0]  # Fixed from database
+            ucl = control_limits_data['UCL'].iloc[0]  # Fixed from database
+        else:
+            lcl, ucl = 0, 100  # Default fallback
+        
+        # Calculate the middle value of Y-ROW from ALL data (not just selected tools)
+        all_data_for_median = filtered_data.copy()
+        middle_y_row = all_data_for_median['Y-ROW'].median()
+        
+        mask = filtered_data.Tool.isin(tool) 
+        filtered_data = filtered_data[mask]
+        # Filter data to include only rows where Y-ROW is within ±1 of the middle value
+        filtered_data = filtered_data[(filtered_data['Y-ROW'] >= middle_y_row - 1) & (filtered_data['Y-ROW'] <= middle_y_row + 1)]
+        
+        # Sort the filtered data by X-COL
+        sorted_data = filtered_data.sort_values(by='X-COL')
+        sorted_tools = sorted([str(tl) for tl in filtered_data['Tool'].unique().tolist() if tl is not None])
+        title = "Selected Lots by Tool"                                  
+        
+        fig = px.line(sorted_data,   
+            x='X-COL', y='CD', color='Tool'
+            ,color_discrete_sequence = ['darkorange', 'dodgerblue', 'green', 'darkviolet']
+            ,line_shape="hv"
+            ,hover_data=['LOT', 'WFR']
+            ,markers=True,
+            title=title,
+            template=chart_theme,
+            category_orders={'Tool': sorted_tools})
+        fig.update_traces(mode="markers")
+        
+        # Add trend lines for each tool (connecting means at each X-COL)
+        colors = ['darkorange', 'dodgerblue', 'green', 'darkviolet']
+        for i, tl in enumerate(sorted_tools):
+            tool_data = sorted_data[sorted_data['Tool'] == tl]
+            if len(tool_data) > 0:
+                # Calculate mean CD at each X-COL position for this tool
+                tool_means = tool_data.groupby('X-COL')['CD'].mean().reset_index()
+                tool_means = tool_means.sort_values('X-COL')
+                
+                # Add trend line connecting the means
+                fig.add_trace(go.Scatter(
+                    x=tool_means['X-COL'], 
+                    y=tool_means['CD'],
+                    mode='lines',
+                    name=f'Trend {tl}',
+                    line=dict(color=colors[i % len(colors)], dash='dot', width=3),
+                    showlegend=False
+                ))
+        
+        # Use helper function to add fixed control limits and percentage-based zoom
+        fig = get_control_limits_and_apply_zoom(fig, selected_tech_layer, selected_chart_mpx, zoom_percentage, "X-Column Chart")
+        return fig
+        
+    except Exception as e:
+        print(f"❌ Error updating line chart: {e}")
+        return px.line(title="Error loading chart")
 
 # Create plotly express by Yrow for lot selection with tool color
 @app.callback(
@@ -1156,65 +1230,78 @@ def update_line_chart_tool_xcol(tool, start_date, end_date, chamber, limits, sel
     Input("chart_MP_radio", "value"),
     Input('lot_list_table', 'selected_rows'),
     State("lot_list_table", "data"))
-def update_line_chart_tool_yrow(tool, start_date, end_date, chamber, limits, selected_tech_layer, selected_chart_mpx, selected_rows, data):    # callback function arg 'tool' refers to the component property of the input or "value" above
-    if selected_rows:
-        selected_lots = [data[i]['LOT'] for i in selected_rows if i < len(data)]
-        filtered_data = df.query(
-            "DATE >= @start_date and DATE <= @end_date and TECH_LAYER == @selected_tech_layer and MP == @selected_chart_mpx and LOT in @selected_lots")
-    else:
-        filtered_data = df.query(
-            "DATE >= @start_date and DATE <= @end_date and TECH_LAYER == @selected_tech_layer and MP == @selected_chart_mpx")
-    
-    # Calculate the middle value of X-COL from ALL data (not just selected tools)
-    # This ensures consistent filtering regardless of which tools are selected
-    all_data_for_median = filtered_data.copy()  # Use the same lot filtering but before tool filtering
-    middle_x_col = all_data_for_median['X-COL'].median()
-    
-    mask = filtered_data.Tool.isin(tool) 
-    filtered_data = filtered_data[mask]
-    # Filter data to include only rows where X-COL is within ±1 of the middle value
-    filtered_data = filtered_data[(filtered_data['X-COL'] >= middle_x_col - 1) & (filtered_data['X-COL'] <= middle_x_col + 1)]
-    # Sort the filtered data by Y-ROW
-    sorted_data = filtered_data.sort_values(by='Y-ROW')
-    sorted_tools = sorted([str(tl) for tl in filtered_data['Tool'].unique().tolist() if tl is not None])
-    title = "Across Wafer by Tool"                                  
-    fig = px.line(sorted_data,   
-        x='Y-ROW', y='CD', color='Tool'
-        ,color_discrete_sequence = ['darkorange', 'dodgerblue', 'green', 'darkviolet']
-        ,line_shape="hv"
-        ,hover_data=['LOT', 'WFR']
-        ,markers=True,
-        title=title,
-        template=chart_theme,
-        category_orders={'Tool': sorted_tools})
-    fig.update_traces(mode="markers")
-    
-    # Add trend lines for each tool (connecting means at each Y-ROW)
-    colors = ['darkorange', 'dodgerblue', 'green', 'darkviolet']
-    for i, tl in enumerate(sorted_tools):
-        tool_data = sorted_data[sorted_data['Tool'] == tl]
-        if len(tool_data) > 0:
-            # Calculate mean CD at each Y-ROW position for this tool
-            tool_means = tool_data.groupby('Y-ROW')['CD'].mean().reset_index()
-            # Sort by Y-ROW to ensure proper line connection
-            tool_means = tool_means.sort_values('Y-ROW')
-            
-            # Add trend line connecting the means
-            fig.add_trace(go.Scatter(
-                x=tool_means['Y-ROW'], 
-                y=tool_means['CD'],
-                mode='lines',
-                name=f'Trend {tl}',
-                line=dict(color=colors[i % len(colors)], dash='dot', width=3),
-                showlegend=False
-            ))
-    
-    fig.add_hline(y=limits[0], line_width=2, line_dash="dash", line_color="red")
-    fig.add_hline(y=limits[1], line_width=2, line_dash="dash", line_color="red")
-    fig.add_hline(y=limits[0] - 0.02 * limits[0], line_width=1, line_dash="solid", line_color="white")
-    fig.add_hline(y=limits[1] + 0.02 * limits[1], line_width=1, line_dash="solid", line_color="white")
-    #fig.add_hline(y=target, line_width=1, line_dash="dash", line_color="black")
-    return fig
+def update_line_chart_tool_yrow(tool, start_date, end_date, chamber, zoom_percentage, selected_tech_layer, selected_chart_mpx, selected_rows, data):
+    """
+    Updates Y-row line chart with tool data. Uses fixed LCL/UCL from database and zoom_percentage for Y-axis limits.
+    """
+    try:
+        if selected_rows:
+            selected_lots = [data[i]['LOT'] for i in selected_rows if i < len(data)]
+            filtered_data = df.query(
+                "DATE >= @start_date and DATE <= @end_date and TECH_LAYER == @selected_tech_layer and MP == @selected_chart_mpx and LOT in @selected_lots")
+        else:
+            filtered_data = df.query(
+                "DATE >= @start_date and DATE <= @end_date and TECH_LAYER == @selected_tech_layer and MP == @selected_chart_mpx")
+        
+        # Get fixed control limits from database
+        control_limits_data = df[(df['TECH_LAYER'] == selected_tech_layer) & (df['MP'] == selected_chart_mpx)]
+        if not control_limits_data.empty:
+            lcl = control_limits_data['LCL'].iloc[0]  # Fixed from database
+            ucl = control_limits_data['UCL'].iloc[0]  # Fixed from database
+        else:
+            lcl, ucl = 0, 100  # Default fallback
+        
+        # Calculate the middle value of X-COL from ALL data (not just selected tools)
+        all_data_for_median = filtered_data.copy()
+        middle_x_col = all_data_for_median['X-COL'].median()
+        
+        mask = filtered_data.Tool.isin(tool) 
+        filtered_data = filtered_data[mask]
+        # Filter data to include only rows where X-COL is within ±1 of the middle value
+        filtered_data = filtered_data[(filtered_data['X-COL'] >= middle_x_col - 1) & (filtered_data['X-COL'] <= middle_x_col + 1)]
+        
+        # Sort the filtered data by Y-ROW
+        sorted_data = filtered_data.sort_values(by='Y-ROW')
+        sorted_tools = sorted([str(tl) for tl in filtered_data['Tool'].unique().tolist() if tl is not None])
+        title = "Across Wafer by Tool"                                  
+        
+        fig = px.line(sorted_data,   
+            x='Y-ROW', y='CD', color='Tool'
+            ,color_discrete_sequence = ['darkorange', 'dodgerblue', 'green', 'darkviolet']
+            ,line_shape="hv"
+            ,hover_data=['LOT', 'WFR']
+            ,markers=True,
+            title=title,
+            template=chart_theme,
+            category_orders={'Tool': sorted_tools})
+        fig.update_traces(mode="markers")
+        
+        # Add trend lines for each tool (connecting means at each Y-ROW)
+        colors = ['darkorange', 'dodgerblue', 'green', 'darkviolet']
+        for i, tl in enumerate(sorted_tools):
+            tool_data = sorted_data[sorted_data['Tool'] == tl]
+            if len(tool_data) > 0:
+                # Calculate mean CD at each Y-ROW position for this tool
+                tool_means = tool_data.groupby('Y-ROW')['CD'].mean().reset_index()
+                tool_means = tool_means.sort_values('Y-ROW')
+                
+                # Add trend line connecting the means
+                fig.add_trace(go.Scatter(
+                    x=tool_means['Y-ROW'], 
+                    y=tool_means['CD'],
+                    mode='lines',
+                    name=f'Trend {tl}',
+                    line=dict(color=colors[i % len(colors)], dash='dot', width=3),
+                    showlegend=False
+                ))
+        
+        # Use helper function to add fixed control limits and percentage-based zoom
+        fig = get_control_limits_and_apply_zoom(fig, selected_tech_layer, selected_chart_mpx, zoom_percentage, "Y-Row Chart")
+        return fig
+        
+    except Exception as e:
+        print(f"❌ Error updating Y-row line chart: {e}")
+        return px.line(title="Error loading chart")
 
 # Summary table update 
 @app.callback(
@@ -1281,30 +1368,36 @@ def lot_list_table(start_date, end_date, selected_tech_layer, selected_chart_mpx
     Input("limit-slider", "value"),
     Input("tech_layer_dd", "value"),  # Add TECH_LAYER dropdown as input
     Input("chart_MP_radio", "value"))  # Add MP dropdown as input
-def update_line_chart(tool, start_date, end_date, limits, selected_tech_layer, selected_chart_mpx):    # callback function arg 'tool' refers to the component property of the input or "value" above
-    filtered_data = df.query("DATE >= @start_date and DATE <= @end_date and TECH_LAYER == @selected_tech_layer and MP == @selected_chart_mpx")  # If table turned ON then update with values
-    tooll = sorted(filtered_data['Tool'].unique().tolist())
-    mask = filtered_data.Tool.isin(tool) 
-    layer = filtered_data['LAYER'].iloc[0]
-    resist = str(filtered_data['RESIST'].iloc[0])
-    opn = str(filtered_data['OPN'].iloc[0])
-    structure = filtered_data['STRUCTURE'].iloc[0]
-    title = layer + ' (' + resist + '/' + opn + ') ' + structure if not filtered_data.empty else "No Data"                                  # Create a panda series with True/False of only tools selected 
-    fig = px.line(filtered_data[mask],   
-        x='DATETIME', y='CD', color='Tool'
-        ,category_orders={'Tool':tooll}  # can manually set colors color_discrete_sequence = ['darkred', 'dodgerblue', 'green', 'tan']
-        ,color_discrete_sequence = ['darkorange', 'dodgerblue', 'green', 'darkviolet']
-        ,line_shape="hv"
-        ,hover_data=['LOT', 'WFR', 'RESIST_RCP', 'PRODUCT', 'RETICLE', 'SLOT', 'ITC-CH', 'BCT-CH', 'COT-CH', 'PCT-CH', 'BAKE1-CH', 'BAKE1-CH','BAKE2-CH','DEV-CH','BAKE3-CH','X-Y']
-        ,markers=True,
-        title=title,
-        template=chart_theme)
-    fig.update_traces(mode="markers")
-    fig.add_hline(y=limits[0], line_width=2, line_dash="dash", line_color="red")
-    fig.add_hline(y=limits[1], line_width=2, line_dash="dash", line_color="red")
-    fig.add_hline(y=limits[0] - 0.02 * limits[0], line_width=1, line_dash="solid", line_color="white")
-    fig.add_hline(y=limits[1] + 0.02 * limits[1], line_width=1, line_dash="solid", line_color="white")
-    #fig.add_hline(y=target, line_width=1, line_dash="dash", line_color="black")
+def update_line_chart(tool, start_date, end_date, zoom_percentage, selected_tech_layer, selected_chart_mpx):    # callback function arg 'tool' refers to the component property of the input or "value" above
+    try:
+        filtered_data = df.query("DATE >= @start_date and DATE <= @end_date and TECH_LAYER == @selected_tech_layer and MP == @selected_chart_mpx")  # If table turned ON then update with values
+        tooll = sorted(filtered_data['Tool'].unique().tolist())
+        mask = filtered_data.Tool.isin(tool) 
+        layer = filtered_data['LAYER'].iloc[0] if not filtered_data.empty else "Unknown"
+        resist = str(filtered_data['RESIST'].iloc[0]) if not filtered_data.empty else "Unknown"
+        opn = str(filtered_data['OPN'].iloc[0]) if not filtered_data.empty else "Unknown"
+        structure = filtered_data['STRUCTURE'].iloc[0] if not filtered_data.empty else "Unknown"
+        title = layer + ' (' + resist + '/' + opn + ') ' + structure if not filtered_data.empty else "No Data"                                  # Create a panda series with True/False of only tools selected 
+        
+        fig = px.line(filtered_data[mask],   
+            x='DATETIME', y='CD', color='Tool'
+            ,category_orders={'Tool':tooll}  # can manually set colors color_discrete_sequence = ['darkred', 'dodgerblue', 'green', 'tan']
+            ,color_discrete_sequence = ['darkorange', 'dodgerblue', 'green', 'darkviolet']
+            ,line_shape="hv"
+            ,hover_data=['LOT', 'WFR', 'RESIST_RCP', 'PRODUCT', 'RETICLE', 'SLOT', 'ITC-CH', 'BCT-CH', 'COT-CH', 'PCT-CH', 'BAKE1-CH', 'BAKE1-CH','BAKE2-CH','DEV-CH','BAKE3-CH','X-Y']
+            ,markers=True,
+            title=title,
+            template=chart_theme)
+        fig.update_traces(mode="markers")
+        
+        # Use helper function to add fixed control limits and percentage-based zoom
+        fig = get_control_limits_and_apply_zoom(fig, selected_tech_layer, selected_chart_mpx, zoom_percentage, "Line Chart 1")
+        
+        return fig
+        
+    except Exception as e:
+        print(f"❌ Error updating line chart 1: {e}")
+        return px.line(title="Error loading chart")
     return fig
 
 # Create plotly express box plot
@@ -1316,22 +1409,29 @@ def update_line_chart(tool, start_date, end_date, limits, selected_tech_layer, s
     Input("limit-slider", "value"),
     Input('tech_layer_dd', 'value'),
     Input('chart_MP_radio', 'value'))
-def generate_bx_chamber(start_date, end_date, chamber, limits, selected_tech_layer, selected_chart_mpx):
-    filtered_data = df.query("DATE >= @start_date and DATE <= @end_date and TECH_LAYER == @selected_tech_layer and MP == @selected_chart_mpx")  # If table turned ON then update with values
-    tooll = sorted(filtered_data['Tool'].unique().tolist())
-    sorted_chambers = sorted([str(ch) for ch in filtered_data[chamber].unique().tolist() if ch is not None])
-    layer = filtered_data['LAYER'].iloc[0]
-    resist = str(filtered_data['RESIST'].iloc[0])
-    opn = str(filtered_data['OPN'].iloc[0])
-    structure = filtered_data['STRUCTURE'].iloc[0]
-    title = layer + ' (' + resist + '/' + opn + ') ' + structure if not filtered_data.empty else "No Data"
-    fig = px.box(filtered_data, x="Tool", y='CD', color=chamber, notched=True, template=chart_theme, hover_data=[filtered_data['LOT'], filtered_data['WFR'],  filtered_data['RESIST_RCP']], category_orders={"Tool": tooll, chamber: sorted_chambers}, title=title)
-    fig.add_hline(y=limits[0], line_width=2, line_dash="dash", line_color="red")
-    fig.add_hline(y=limits[1], line_width=2, line_dash="dash", line_color="red")
-    fig.add_hline(y=limits[0] - 0.02 * limits[0], line_width=1, line_dash="solid", line_color="white")
-    fig.add_hline(y=limits[1] + 0.02 * limits[1], line_width=1, line_dash="solid", line_color="white")
-    #fig.add_hline(y=target, line_width=1, line_dash="dash", line_color="black")
-    return fig
+def generate_bx_chamber(start_date, end_date, chamber, zoom_percentage, selected_tech_layer, selected_chart_mpx):
+    try:
+        filtered_data = df.query("DATE >= @start_date and DATE <= @end_date and TECH_LAYER == @selected_tech_layer and MP == @selected_chart_mpx")  # If table turned ON then update with values
+        tooll = sorted(filtered_data['Tool'].unique().tolist())
+        sorted_chambers = sorted([str(ch) for ch in filtered_data[chamber].unique().tolist() if ch is not None])
+        layer = filtered_data['LAYER'].iloc[0] if not filtered_data.empty else "Unknown"
+        resist = str(filtered_data['RESIST'].iloc[0]) if not filtered_data.empty else "Unknown"
+        opn = str(filtered_data['OPN'].iloc[0]) if not filtered_data.empty else "Unknown"
+        structure = filtered_data['STRUCTURE'].iloc[0] if not filtered_data.empty else "Unknown"
+        title = layer + ' (' + resist + '/' + opn + ') ' + structure if not filtered_data.empty else "No Data"
+        
+        fig = px.box(filtered_data, x="Tool", y='CD', color=chamber, notched=True, template=chart_theme, 
+                    hover_data=[filtered_data['LOT'], filtered_data['WFR'], filtered_data['RESIST_RCP']], 
+                    category_orders={"Tool": tooll, chamber: sorted_chambers}, title=title)
+        
+        # Use helper function to add fixed control limits and percentage-based zoom
+        fig = get_control_limits_and_apply_zoom(fig, selected_tech_layer, selected_chart_mpx, zoom_percentage, "Box Plot Chamber")
+        
+        return fig
+        
+    except Exception as e:
+        print(f"❌ Error updating box plot chamber: {e}")
+        return px.box(title="Error loading chart")
 
 # Create plotly express box plot for lot selections
 @app.callback(
@@ -1344,28 +1444,36 @@ def generate_bx_chamber(start_date, end_date, chamber, limits, selected_tech_lay
     Input('chart_MP_radio', 'value'),
     Input('lot_list_table', 'selected_rows'),
     State("lot_list_table", "data"))
-def generate_bx_chamber(start_date, end_date, chamber, limits, selected_tech_layer, selected_chart_mpx, selected_rows, data):
-    if selected_rows:
-        selected_lots = [data[i]['LOT'] for i in selected_rows if i < len(data)]
-        filtered_data = df.query(
-            "DATE >= @start_date and DATE <= @end_date and TECH_LAYER == @selected_tech_layer and MP == @selected_chart_mpx and LOT in @selected_lots")
-    else:
-        filtered_data = df.query(
-            "DATE >= @start_date and DATE <= @end_date and TECH_LAYER == @selected_tech_layer and MP == @selected_chart_mpx")
-    tooll = sorted(filtered_data['Tool'].unique().tolist())
-    sorted_chambers = sorted([str(ch) for ch in filtered_data[chamber].unique().tolist() if ch is not None])
-    layer = filtered_data['LAYER'].iloc[0]
-    resist = str(filtered_data['RESIST'].iloc[0])
-    opn = str(filtered_data['OPN'].iloc[0])
-    structure = filtered_data['STRUCTURE'].iloc[0]
-    title = layer + ' (' + resist + '/' + opn + ') ' + structure if not filtered_data.empty else "No Data"
-    fig = px.box(filtered_data, x="Tool", y='CD', color=chamber, notched=True, template=chart_theme, hover_data=[filtered_data['LOT'], filtered_data['WFR'],  filtered_data['RESIST_RCP']], category_orders={"Tool": tooll, chamber: sorted_chambers}, title=title)
-    fig.add_hline(y=limits[0], line_width=2, line_dash="dash", line_color="red")
-    fig.add_hline(y=limits[1], line_width=2, line_dash="dash", line_color="red")
-    fig.add_hline(y=limits[0] - 0.02 * limits[0], line_width=1, line_dash="solid", line_color="white")
-    fig.add_hline(y=limits[1] + 0.02 * limits[1], line_width=1, line_dash="solid", line_color="white")
-    #fig.add_hline(y=target, line_width=1, line_dash="dash", line_color="black")
-    return fig
+def generate_bx_chamber(start_date, end_date, chamber, zoom_percentage, selected_tech_layer, selected_chart_mpx, selected_rows, data):
+    try:
+        if selected_rows:
+            selected_lots = [data[i]['LOT'] for i in selected_rows if i < len(data)]
+            filtered_data = df.query(
+                "DATE >= @start_date and DATE <= @end_date and TECH_LAYER == @selected_tech_layer and MP == @selected_chart_mpx and LOT in @selected_lots")
+        else:
+            filtered_data = df.query(
+                "DATE >= @start_date and DATE <= @end_date and TECH_LAYER == @selected_tech_layer and MP == @selected_chart_mpx")
+        
+        tooll = sorted(filtered_data['Tool'].unique().tolist())
+        sorted_chambers = sorted([str(ch) for ch in filtered_data[chamber].unique().tolist() if ch is not None])
+        layer = filtered_data['LAYER'].iloc[0] if not filtered_data.empty else "Unknown"
+        resist = str(filtered_data['RESIST'].iloc[0]) if not filtered_data.empty else "Unknown"
+        opn = str(filtered_data['OPN'].iloc[0]) if not filtered_data.empty else "Unknown"
+        structure = filtered_data['STRUCTURE'].iloc[0] if not filtered_data.empty else "Unknown"
+        title = layer + ' (' + resist + '/' + opn + ') ' + structure if not filtered_data.empty else "No Data"
+        
+        fig = px.box(filtered_data, x="Tool", y='CD', color=chamber, notched=True, template=chart_theme, 
+                    hover_data=[filtered_data['LOT'], filtered_data['WFR'], filtered_data['RESIST_RCP']], 
+                    category_orders={"Tool": tooll, chamber: sorted_chambers}, title=title)
+        
+        # Use helper function to add fixed control limits and percentage-based zoom
+        fig = get_control_limits_and_apply_zoom(fig, selected_tech_layer, selected_chart_mpx, zoom_percentage, "Box Plot Chamber Selected")
+        
+        return fig
+        
+    except Exception as e:
+        print(f"❌ Error updating box plot chamber selected: {e}")
+        return px.box(title="Error loading chart")
 
 # Callback to unselect all rows from the lot table
 @app.callback(
@@ -1407,10 +1515,12 @@ def update_line_chart(tool, start_date, end_date, chamber, limits, selected_tech
         title=title,
         template=chart_theme)
     fig.update_traces(mode="markers")
-    fig.add_hline(y=limits[0], line_width=2, line_dash="dash", line_color="red")
-    fig.add_hline(y=limits[1], line_width=2, line_dash="dash", line_color="red")
-    fig.add_hline(y=limits[0] - 0.02 * limits[0], line_width=1, line_dash="solid", line_color="white")
-    fig.add_hline(y=limits[1] + 0.02 * limits[1], line_width=1, line_dash="solid", line_color="white")
+    # Use helper function to add fixed control limits and percentage-based zoom
+    try:
+        zoom_pct = limits if isinstance(limits, (int, float)) else 10
+        fig = get_control_limits_and_apply_zoom(fig, selected_tech_layer, selected_chart_mpx, zoom_pct, "Chart")
+    except:
+        fig = get_control_limits_and_apply_zoom(fig, selected_tech_layer, selected_chart_mpx, 10, "Chart")
     #fig.add_hline(y=target, line_width=1, line_dash="dash", line_color="black")
     return fig
 
@@ -1446,10 +1556,12 @@ def update_line_chart(tool, start_date, end_date, chamber, limits, selected_tech
         template=chart_theme,
         category_orders={chamber: sorted_chambers})
     fig.update_traces(mode="markers")
-    fig.add_hline(y=limits[0], line_width=2, line_dash="dash", line_color="red")
-    fig.add_hline(y=limits[1], line_width=2, line_dash="dash", line_color="red")
-    fig.add_hline(y=limits[0] - 0.02 * limits[0], line_width=1, line_dash="solid", line_color="white")
-    fig.add_hline(y=limits[1] + 0.02 * limits[1], line_width=1, line_dash="solid", line_color="white")
+    # Use helper function to add fixed control limits and percentage-based zoom
+    try:
+        zoom_pct = limits if isinstance(limits, (int, float)) else 10
+        fig = get_control_limits_and_apply_zoom(fig, selected_tech_layer, selected_chart_mpx, zoom_pct, "Chart")
+    except:
+        fig = get_control_limits_and_apply_zoom(fig, selected_tech_layer, selected_chart_mpx, 10, "Chart")
     #fig.add_hline(y=target, line_width=1, line_dash="dash", line_color="black")
     return fig
 
@@ -1485,10 +1597,12 @@ def update_line_chart(tool, start_date, end_date, chamber, limits, selected_tech
         template=chart_theme,
         category_orders={chamber: sorted_chambers})
     fig.update_traces(mode="markers")
-    fig.add_hline(y=limits[0], line_width=2, line_dash="dash", line_color="red")
-    fig.add_hline(y=limits[1], line_width=2, line_dash="dash", line_color="red")
-    fig.add_hline(y=limits[0] - 0.02 * limits[0], line_width=1, line_dash="solid", line_color="white")
-    fig.add_hline(y=limits[1] + 0.02 * limits[1], line_width=1, line_dash="solid", line_color="white")
+    # Use helper function to add fixed control limits and percentage-based zoom
+    try:
+        zoom_pct = limits if isinstance(limits, (int, float)) else 10
+        fig = get_control_limits_and_apply_zoom(fig, selected_tech_layer, selected_chart_mpx, zoom_pct, "Chart")
+    except:
+        fig = get_control_limits_and_apply_zoom(fig, selected_tech_layer, selected_chart_mpx, 10, "Chart")
     #fig.add_hline(y=target, line_width=1, line_dash="dash", line_color="black")
     return fig
 
@@ -1553,10 +1667,12 @@ def update_line_chart(tool, start_date, end_date, chamber, limits, selected_tech
                 showlegend=False
             ))
     
-    fig.add_hline(y=limits[0], line_width=2, line_dash="dash", line_color="red")
-    fig.add_hline(y=limits[1], line_width=2, line_dash="dash", line_color="red")
-    fig.add_hline(y=limits[0] - 0.02 * limits[0], line_width=1, line_dash="solid", line_color="white")
-    fig.add_hline(y=limits[1] + 0.02 * limits[1], line_width=1, line_dash="solid", line_color="white")
+    # Use helper function to add fixed control limits and percentage-based zoom
+    try:
+        zoom_pct = limits if isinstance(limits, (int, float)) else 10
+        fig = get_control_limits_and_apply_zoom(fig, selected_tech_layer, selected_chart_mpx, zoom_pct, "Chart")
+    except:
+        fig = get_control_limits_and_apply_zoom(fig, selected_tech_layer, selected_chart_mpx, 10, "Chart")
     #fig.add_hline(y=target, line_width=1, line_dash="dash", line_color="black")
     return fig
 
@@ -1621,11 +1737,13 @@ def update_line_chart(tool, start_date, end_date, chamber, limits, selected_tech
                 showlegend=False
             ))
     
-    fig.add_hline(y=limits[0], line_width=2, line_dash="dash", line_color="red")
-    fig.add_hline(y=limits[1], line_width=2, line_dash="dash", line_color="red")
-    fig.add_hline(y=limits[0] - 0.02 * limits[0], line_width=1, line_dash="solid", line_color="white")
-    fig.add_hline(y=limits[1] + 0.02 * limits[1], line_width=1, line_dash="solid", line_color="white")
-    #fig.add_hline(y=target, line_width=1, line_dash="dash", line_color="black")
+    # Use helper function to add fixed control limits and percentage-based zoom
+    try:
+        zoom_pct = limits if isinstance(limits, (int, float)) else 10
+        fig = get_control_limits_and_apply_zoom(fig, selected_tech_layer, selected_chart_mpx, zoom_pct, "Chamber Line Chart")
+    except:
+        fig = get_control_limits_and_apply_zoom(fig, selected_tech_layer, selected_chart_mpx, 10, "Chamber Line Chart")
+    
     return fig
 
 # =============================================================================
